@@ -4834,6 +4834,21 @@ def compile_factors() -> dict[str, object]:
 
         factors[factor] = normalize_value(raw)
 
+    # Out-of-tree switches. Forks, plugins and out-of-tree backends read
+    # their own VLLM_-prefixed variables straight from os.environ, so this
+    # module never sees them -- yet they select kernels and therefore change
+    # the compiled graph. Left out of the key, a compiled artifact from one
+    # kernel route is silently reused for another; that is the classic
+    # "cached run answers differently" report. Hash whatever is set: an
+    # over-invalidated cache costs a recompile, a wrongly reused one costs
+    # correctness.
+    for name, value in os.environ.items():
+        if not name.startswith("VLLM_"):
+            continue
+        if name in factors or name in ignored_factors:
+            continue
+        factors[name] = normalize_value(value)
+
     ray_noset_env_vars = [
         # Refer to
         # https://github.com/ray-project/ray/blob/c584b1ea97b00793d1def71eaf81537d70efba42/python/ray/_private/accelerators/nvidia_gpu.py#L11
