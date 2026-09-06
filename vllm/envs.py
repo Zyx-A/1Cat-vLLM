@@ -770,6 +770,8 @@ if TYPE_CHECKING:
     VLLM_PLE_OFFLOAD_AUTO_NUMA: bool = True
     VLLM_PLE_OFFLOAD_PREFAULT: bool = True
     VLLM_PLE_OFFLOAD_READY_TIMEOUT: float = 600.0
+    VLLM_QWEN4EXP_PLE_HOST_GIB: float | None = None
+    VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB: float | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -4548,6 +4550,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Timeout for PLE weight loading and TP worker registration.
     "VLLM_PLE_OFFLOAD_READY_TIMEOUT": lambda: float(
         os.getenv("VLLM_PLE_OFFLOAD_READY_TIMEOUT", "600")
+    ),
+    # Qwen4Exp pinned-host PLE: host memory in GiB, per tensor-parallel rank,
+    # for the part of the FP8 n-gram table that does not stay in device
+    # memory. Unset or "auto": derived from the device headroom left beside
+    # the weights and the KV cache of the requested context.
+    "VLLM_QWEN4EXP_PLE_HOST_GIB": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "auto").strip().lower()
+        in ("", "auto")
+        else float(os.getenv("VLLM_QWEN4EXP_PLE_HOST_GIB", "0"))
+    ),
+    # Device memory in GiB the automatic PLE placement keeps free for the
+    # activation peak and the CUDA graph pool. Unset: 8 % of the device,
+    # at most 4 GiB.
+    "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB": lambda: (
+        None
+        if os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "").strip() == ""
+        else float(os.getenv("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB", "0"))
     ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model

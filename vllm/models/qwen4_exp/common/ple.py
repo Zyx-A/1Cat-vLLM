@@ -3,11 +3,13 @@
 """Common Qwen4Exp PLE helpers."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.distributed.utils import get_layers_outside_first_pp_rank
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def check_ple_layers_on_first_pp_rank(text_config: Any, pp_size: int) -> None:
@@ -101,3 +103,140 @@ def copy_ple_embedding_shard_(
     with torch.no_grad():
         target.copy_(source.to(device=target.device, dtype=target.dtype))
     return overlap.row_count
+
+
+@dataclass(frozen=True)
+class PLEPlacement:
+    """How many PLE table rows live in device memory and how many on the host."""
+
+    vram_rows: int
+    host_rows: int
+
+    @property
+    def total_rows(self) -> int:
+        return self.vram_rows + self.host_rows
+
+
+def plan_ple_placement(
+    *,
+    total_rows: int,
+    row_bytes: int,
+    host_budget_bytes: int,
+) -> PLEPlacement:
+    """Place as many PLE rows as possible in device memory.
+
+    The table is addressed by hashes, so every row is equally likely to be read
+    and the split point carries no meaning beyond capacity: whatever does not
+    fit in device memory goes to the host. Rows are never dropped, so the
+    caller must provide a host budget large enough for the remainder.
+    """
+
+    if total_rows < 0 or row_bytes <= 0:
+        raise ValueError("total_rows must be non-negative and row_bytes positive")
+    if host_budget_bytes < 0:
+        raise ValueError("host budget must be non-negative")
+    host_rows = min(total_rows, host_budget_bytes // row_bytes)
+    return PLEPlacement(vram_rows=total_rows - host_rows, host_rows=host_rows)
+
+
+def copy_ple_embedding_shard_split_(
+    vram_table: torch.Tensor,
+    host_table: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    *,
+    checkpoint_start: int,
+    tp_start: int,
+    tp_end: int,
+) -> int:
+    """Copy one checkpoint shard into a table split across device and host.
+
+    The split point is a row index in the TP-local range, so both halves are
+    plain sub-ranges of the same vocabulary interval and the single-target
+    copy above handles each of them unchanged.
+    """
+
+    boundary = tp_start + vram_table.shape[0]
+    if boundary > tp_end:
+        raise ValueError(
+            f"device part ({vram_table.shape[0]} rows) exceeds the TP range "
+            f"({tp_end - tp_start} rows)"
+        )
+    copied = 0
+    if vram_table.shape[0]:
+        copied += copy_ple_embedding_shard_(
+            vram_table,
+            loaded_weight,
+            checkpoint_start=checkpoint_start,
+            tp_start=tp_start,
+            tp_end=boundary,
+        )
+    if host_table.shape[0]:
+        copied += copy_ple_embedding_shard_(
+            host_table,
+            loaded_weight,
+            checkpoint_start=checkpoint_start,
+            tp_start=boundary,
+            tp_end=tp_end,
+        )
+    return copied
+
+
+def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
+    """Bytes this rank's KV cache needs to serve ``max_model_len``.
+
+    Sums what every KV-owning layer of this pipeline stage declares. The specs
+    are the engine's own source of truth for that number -- the same ones the
+    allocator consults later -- so the estimate cannot drift from what is
+    actually reserved.
+    """
+
+    from vllm.config import get_layers_from_vllm_config
+    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+    layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)  # type: ignore[type-abstract]
+    total = 0
+    for layer in layers.values():
+        spec = layer.get_kv_cache_spec(vllm_config)
+        if spec is not None:
+            total += spec.max_memory_usage_bytes(vllm_config)
+    return total
+
+
+def auto_ple_host_budget_bytes(
+    *,
+    table_bytes: int,
+    device_total_bytes: int,
+    device_allocated_bytes: int,
+    gpu_memory_utilization: float,
+    kv_cache_bytes: int,
+    reserve_bytes: int,
+) -> int:
+    """Host bytes needed so the requested context still fits beside the table.
+
+    The table stays in device memory and only what the context claims is
+    spilled -- never more. Spilling beyond that would be wasted: with pipeline
+    parallelism the weakest stage caps the block count for all of them, so
+    surplus room on this rank buys nothing while pinned host memory is the
+    scarcer resource.
+    """
+
+    if table_bytes < 0 or device_total_bytes <= 0:
+        raise ValueError("table and device sizes must be non-negative")
+    usable = int(device_total_bytes * gpu_memory_utilization)
+    room_for_table = usable - device_allocated_bytes - kv_cache_bytes - reserve_bytes
+    if room_for_table >= table_bytes:
+        return 0
+    return table_bytes - max(0, room_for_table)
+
+
+def available_host_bytes() -> int | None:
+    """Host memory the kernel currently reports as available, or None."""
+
+    try:
+        with open("/proc/meminfo") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        return None
+    return None
