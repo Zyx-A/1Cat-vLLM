@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm.distributed.utils import get_layers_outside_first_pp_rank
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 

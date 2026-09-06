@@ -506,8 +506,18 @@ def _should_use_pinned_host_ple(config: Qwen4ExpTextConfig) -> bool:
     explicit = getattr(config, "ple_offload_embedding", None)
     if explicit is not None:
         return bool(explicit)
-    capability = current_platform.get_device_capability()
-    return capability is not None and capability.to_int() == 70
+    if not current_platform.is_cuda():
+        return False
+    # Decide on THIS worker's device: on a heterogeneous pipeline the PLE
+    # stage is not necessarily device 0 of the visible list. Every
+    # pre-Ampere card takes the split placement, not only exact Volta: the
+    # generic path dequantizes the whole FP8 table to fp16 inside the
+    # compiled graph (47.7 GiB for Qwen3.8 Flash Next), which none of them
+    # can hold.
+    capability = current_platform.get_device_capability(
+        device_id=torch.accelerator.current_device_index()
+    )
+    return capability is not None and capability.major < 8
 
 
 def _ple_host_budget_bytes() -> int | None:

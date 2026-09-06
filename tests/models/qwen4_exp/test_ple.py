@@ -163,6 +163,38 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
     torch.testing.assert_close(output.float().cpu(), expected[ids.cpu()])
 
 
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((7, 0), True), ((7, 5), True), ((8, 0), False), ((8, 9), False)],
+)
+def test_pinned_host_ple_decides_on_the_worker_device(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int], expected: bool
+) -> None:
+    from vllm.platforms.interface import DeviceCapability
+
+    seen: list[int] = []
+
+    def fake_capability(device_id: int = 0) -> DeviceCapability:
+        seen.append(device_id)
+        return DeviceCapability(*capability)
+
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: False)
+    monkeypatch.setattr(ple_module.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        ple_module.current_platform, "get_device_capability", fake_capability
+    )
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 3)
+
+    config = SimpleNamespace(ple_offload_embedding=None)
+    assert ple_module._should_use_pinned_host_ple(config) is expected
+    # The worker's own device, not device 0 of the visible list.
+    assert seen == [3]
+    # An explicit config choice wins over the capability.
+    assert ple_module._should_use_pinned_host_ple(
+        SimpleNamespace(ple_offload_embedding=not expected)
+    ) is (not expected)
+
+
 def test_plan_ple_placement_spills_only_what_the_budget_holds() -> None:
     assert plan_ple_placement(total_rows=10, row_bytes=8, host_budget_bytes=0) == (
         plan_ple_placement(total_rows=10, row_bytes=8, host_budget_bytes=7)
