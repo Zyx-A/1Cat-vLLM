@@ -19,10 +19,12 @@ from vllm.models.qwen4_exp.common.ple import (
     PLEShardOverlap,
     auto_ple_host_budget_bytes,
     available_host_bytes,
+    cap_host_budget_bytes,
     compute_ple_shard_overlap,
     copy_ple_embedding_shard_,
     copy_ple_embedding_shard_split_,
     plan_ple_placement,
+    total_host_bytes,
 )
 from vllm.models.qwen4_exp.nvidia.ple_layer import (
     Qwen4ExpNGramEmbedding,
@@ -277,6 +279,59 @@ def test_auto_ple_host_budget_spills_only_the_shortfall() -> None:
 def test_available_host_bytes_reads_meminfo() -> None:
     available = available_host_bytes()
     assert available is None or available > 0
+    total = total_host_bytes()
+    assert total is None or total >= (available or 0)
+
+
+def test_cap_host_budget_shares_the_host_between_ranks() -> None:
+    gib = 1024**3
+    # 30 GB host, 20 GiB available, 7.5 GiB reserve, two ranks: 6.25 GiB each.
+    # The 7.09 GiB that double-booked the host on 2026-09-06 is cut to that.
+    share = cap_host_budget_bytes(
+        budget_bytes=int(7.09 * gib),
+        available_bytes=20 * gib,
+        reserve_bytes=int(7.5 * gib),
+        ranks_sharing_host=2,
+    )
+    assert share == int(12.5 * gib) // 2
+    # A budget below the share passes untouched.
+    assert (
+        cap_host_budget_bytes(
+            budget_bytes=2 * gib,
+            available_bytes=20 * gib,
+            reserve_bytes=int(7.5 * gib),
+            ranks_sharing_host=2,
+        )
+        == 2 * gib
+    )
+    # Reserve swallows everything: nothing may be pinned.
+    assert (
+        cap_host_budget_bytes(
+            budget_bytes=2 * gib,
+            available_bytes=6 * gib,
+            reserve_bytes=8 * gib,
+            ranks_sharing_host=2,
+        )
+        == 0
+    )
+    with pytest.raises(ValueError):
+        cap_host_budget_bytes(
+            budget_bytes=gib, available_bytes=gib, reserve_bytes=0, ranks_sharing_host=0
+        )
+
+
+def test_ple_host_reserve_defaults_to_a_quarter_of_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    monkeypatch.setattr(ple_layer.envs, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", None)
+    assert ple_layer._ple_host_reserve_bytes(30 * 1024**3) == int(7.5 * 1024**3)
+    monkeypatch.setattr(ple_layer.envs, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", 4.0)
+    assert ple_layer._ple_host_reserve_bytes(30 * 1024**3) == 4 * 1024**3
+    monkeypatch.setattr(ple_layer.envs, "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB", -1.0)
+    with pytest.raises(ValueError):
+        ple_layer._ple_host_reserve_bytes(30 * 1024**3)
 
 
 def test_post_load_context_keeps_marked_parameter_on_cpu() -> None:
