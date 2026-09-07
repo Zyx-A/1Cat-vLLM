@@ -85,27 +85,35 @@ def _sm70_channel_fp8_qpn8_config(
 
 
 def _sm70_channel_fp8_shape_is_validated(layer: torch.nn.Module) -> bool:
-    """Whether an SM70 channel-FP8 GEMM has been validated for this shape.
+    """Require complete SM70 packed output rows and FP8 scale groups.
 
-    ``_SM70_CHANNEL_FP8_QPN8_SHAPES`` is the only record of which dense shapes
-    have been exercised on SM70. ``fp8_gemm_sm70_out`` does not raise on the
-    others -- it spins without returning -- so the layout conversion below is
-    gated on this instead of on the QPN8 route being selected.
+    PackingImpl<HMMA_884, OPERAND_B> packs 32 output rows, independently of
+    QPN8 tuning or checkpoint identity. Partial N tiles and partial 128-wide
+    K scale groups produce incorrect values with the current dense converter.
+    Preserve generic TurboMind shapes that meet these layout constraints.
     """
-    suffix = getattr(layer, "prefix", "").rsplit(".", 1)[-1]
-    return tuple(layer.weight.shape) == _SM70_CHANNEL_FP8_QPN8_SHAPES.get(suffix)
+    n_dim, k_dim = layer.weight.shape
+    return n_dim > 0 and k_dim > 0 and n_dim % 32 == 0 and k_dim % 128 == 0
 
 
 def _sm70_unpack_channel_fp8(layer: torch.nn.Module) -> None:
     """Dequantize channel-FP8 weights to the model dtype, in place.
 
-    FP8 E4M3 to FP16 is exact, so this costs one extra byte per element on the
-    affected projections and nothing in accuracy.
+    Multiply checkpoint scales in FP32, then round once to the model dtype.
+    Only partial packing tiles take this fallback. Bound FP32 scratch to
+    4 MiB (or one row), rather than expanding a whole matrix in FP32.
     """
     scale = layer.weight_scale.data.to(torch.float32)
     if scale.ndim == 1:
         scale = scale.view(-1, 1)
-    dequantized = (layer.weight.data.to(torch.float32) * scale).to(layer.orig_dtype)
+    weight = layer.weight.data
+    dequantized = torch.empty_like(weight, dtype=layer.orig_dtype)
+    rows_per_chunk = max(1, (4 * 1024**2) // (max(1, weight.shape[1]) * 4))
+    for start in range(0, weight.shape[0], rows_per_chunk):
+        end = start + rows_per_chunk
+        chunk = weight[start:end].to(torch.float32)
+        chunk.mul_(scale[start:end])
+        dequantized[start:end].copy_(chunk)
     replace_parameter(layer, "weight", dequantized)
     for stale in ("weight_scale", "weight_scale_inv", "input_scale"):
         if stale in layer._parameters:
@@ -301,13 +309,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         "prefill workspace; retaining the TurboMind layout."
                     )
             if not _sm70_channel_fp8_shape_is_validated(layer):
-                # No validated SM70 tile covers this shape. fp8_gemm_sm70_out
-                # neither falls back nor raises on such shapes: it spins,
-                # leaving the GPU at 100% utilization near idle power with no
-                # progress and no error. Unpack instead, which is exact.
+                # Partial packing tiles are a numerical/layout restriction,
+                # not an absence from the QPN8 performance-tuning table.
                 logger.warning_once(
-                    "No validated SM70 channel-FP8 GEMM covers %s with shape "
-                    "%s; unpacking these weights to %s instead.",
+                    "SM70 channel-FP8 packing needs full N32/K128 tiles for "
+                    "%s with shape %s; unpacking these weights to %s instead.",
                     getattr(layer, "prefix", "<unknown>"),
                     tuple(layer.weight.shape),
                     layer.orig_dtype,
