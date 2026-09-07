@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
+import copy
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.renderers.hf import (
+    HfRenderer,
     _consolidate_system_messages,
     _convert_developer_to_system,
     _detect_developer_role_support,
@@ -703,6 +708,29 @@ class TestDetectDeveloperRoleSupport:
     def test_absent_in_strict_template(self):
         assert _detect_developer_role_support(STRICT_ROLE_TEMPLATE) is False
 
+    def test_comment_is_not_role_support(self):
+        template = (
+            "{# 'developer' is deliberately unsupported #}" + STRICT_ROLE_TEMPLATE
+        )
+        assert not _detect_developer_role_support(template)
+
+    def test_rejection_branch_is_not_role_support(self):
+        template = (
+            "{% for message in messages %}"
+            "{% if message.role == 'developer' %}"
+            "{{ raise_exception('unsupported role') }}"
+            "{% else %}{{ message.content }}{% endif %}{% endfor %}"
+        )
+        assert not _detect_developer_role_support(template)
+
+    def test_silent_drop_is_not_role_support(self):
+        template = (
+            "{% for message in messages %}"
+            "{% if message.role != 'developer' %}{{ message.content }}"
+            "{% endif %}{% endfor %}"
+        )
+        assert not _detect_developer_role_support(template)
+
 
 class TestSafeApplyChatTemplateDeveloperRole:
     @pytest.fixture
@@ -889,7 +917,7 @@ class TestConsolidateSystemMessages:
         assert result[1]["role"] == "user"
 
     def test_list_content_handled(self):
-        conversation = [
+        conversation: list[dict] = [
             {"role": "user", "content": "Hello"},
             {
                 "role": "system",
@@ -901,7 +929,7 @@ class TestConsolidateSystemMessages:
         ]
         result = _consolidate_system_messages(conversation)
         assert result[0]["role"] == "system"
-        assert result[0]["content"] == "Rule 1.\nRule 2."
+        assert result[0]["content"] == conversation[1]["content"]
         assert result[1]["role"] == "user"
 
     def test_does_not_mutate_original(self):
@@ -914,3 +942,87 @@ class TestConsolidateSystemMessages:
         assert len(conversation) == original_len
         assert conversation[0]["role"] == "user"
         assert conversation[1]["role"] == "system"
+
+    def test_structured_images_and_metadata_are_preserved(self):
+        parts = [
+            {"type": "text", "text": "Inspect this"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.invalid/image"},
+            },
+        ]
+        conversation = [
+            {"role": "user", "content": "Hi"},
+            {"role": "system", "name": "policy", "content": parts},
+            {"role": "system", "name": "policy", "content": "Be concise"},
+        ]
+        original = copy.deepcopy(conversation)
+        result = _consolidate_system_messages(conversation)
+        assert result[0]["name"] == "policy"
+        assert result[0]["content"] == [*parts, {"type": "text", "text": "Be concise"}]
+        assert conversation == original
+
+    def test_conflicting_metadata_is_not_silently_lost(self):
+        conversation = [
+            {"role": "system", "name": "first", "content": "A"},
+            {"role": "system", "name": "second", "content": "B"},
+        ]
+        with pytest.raises(ValueError, match="conflicting metadata"):
+            _consolidate_system_messages(conversation)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_developer_normalization_precedes_multimodal_tracking(
+    monkeypatch, asynchronous
+):
+    import vllm.renderers.hf as hf
+
+    renderer = HfRenderer.__new__(HfRenderer)
+    renderer.model_config = SimpleNamespace(enable_prompt_embeds=False)
+    renderer.get_tokenizer = lambda: object()
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "user"}}],
+        },
+        {
+            "role": "system",
+            "content": [{"type": "image_url", "image_url": {"url": "system"}}],
+        },
+        {"role": "developer", "content": "instruction"},
+    ]
+    original = copy.deepcopy(messages)
+    params = SimpleNamespace(
+        chat_template=STRICT_ROLE_TEMPLATE,
+        chat_template_kwargs={},
+        chat_template_content_format="openai",
+        media_io_kwargs=None,
+        mm_processor_kwargs=None,
+    )
+    monkeypatch.setattr(
+        hf, "resolve_chat_template", lambda *args, **kwargs: STRICT_ROLE_TEMPLATE
+    )
+    monkeypatch.setattr(
+        hf, "resolve_chat_template_content_format", lambda **kwargs: "openai"
+    )
+
+    class ParserReached(Exception):
+        pass
+
+    def parse(parsed_messages, *args, **kwargs):
+        assert [message["role"] for message in parsed_messages] == ["system", "user"]
+        assert parsed_messages[0]["content"][0]["image_url"]["url"] == "system"
+        assert parsed_messages[1]["content"][0]["image_url"]["url"] == "user"
+        raise ParserReached
+
+    async def parse_async(*args, **kwargs):
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(hf, "parse_chat_messages", parse)
+    monkeypatch.setattr(hf, "parse_chat_messages_async", parse_async)
+    with pytest.raises(ParserReached):
+        if asynchronous:
+            asyncio.run(renderer.render_messages_async(messages, params))
+        else:
+            renderer.render_messages(messages, params)
+    assert messages == original
