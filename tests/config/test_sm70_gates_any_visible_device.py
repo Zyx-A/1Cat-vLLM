@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from vllm import platforms
 from vllm.config import (
@@ -45,6 +46,25 @@ def _fake_platform(capabilities: list[tuple[int, int]], is_cuda: bool = True):
     )
 
 
+def _placement_config(world_size=1, **overrides):
+    values = dict(
+        distributed_executor_backend="mp" if world_size > 1 else "uni",
+        data_parallel_backend="mp",
+        world_size=world_size,
+        local_world_size=world_size,
+        nnodes_within_dp=1,
+        data_parallel_rank_local=0,
+        data_parallel_index=0,
+        tensor_parallel_size=1,
+        pipeline_parallel_size=world_size,
+    )
+    values.update(overrides)
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(**values),
+        device_config=SimpleNamespace(device=torch.device("cuda")),
+    )
+
+
 @pytest.mark.parametrize(
     ("capabilities", "expected"),
     [
@@ -55,31 +75,29 @@ def _fake_platform(capabilities: list[tuple[int, int]], is_cuda: bool = True):
         pytest.param([], False, id="no-devices"),
     ],
 )
-def test_any_visible_device_is_capability(monkeypatch, capabilities, expected):
-    from vllm.config.vllm import _any_visible_device_is_capability
+def test_any_participating_device_is_capability(monkeypatch, capabilities, expected):
+    from vllm.config.vllm import _any_participating_device_is_capability
 
     monkeypatch.setattr(platforms, "current_platform", _fake_platform(capabilities))
-    assert _any_visible_device_is_capability(SM70) is expected
+    cfg = _placement_config(world_size=len(capabilities))
+    assert _any_participating_device_is_capability(cfg, SM70) is expected
 
 
-def test_any_visible_device_is_capability_requires_cuda(monkeypatch):
-    from vllm.config.vllm import _any_visible_device_is_capability
+def test_any_participating_device_is_capability_requires_cuda(monkeypatch):
+    from vllm.config.vllm import _any_participating_device_is_capability
 
     monkeypatch.setattr(
         platforms, "current_platform", _fake_platform([SM70], is_cuda=False)
     )
-    assert _any_visible_device_is_capability(SM70) is False
+    assert _any_participating_device_is_capability(_placement_config(), SM70) is False
 
 
-def test_prefix_anchored_swa_accepts_sm70_behind_sm75(monkeypatch):
-    """The engine contract only needs an SM70 device somewhere in the grid."""
+def test_prefix_anchored_swa_requires_supported_hardware_on_every_rank(monkeypatch):
+    """Do not relax backend support because only one participant is SM70."""
     monkeypatch.setattr(platforms, "current_platform", _fake_platform([SM75, SM70]))
-    cfg = SimpleNamespace(
-        attention_config=SimpleNamespace(prefix_anchored_decode_window=64),
-    )
-    # Passing the capability gate means reaching the model-config check.
-    with pytest.raises(ValueError, match="requires a model config"):
-        cfg.model_config = None
+    cfg = _placement_config(world_size=2)
+    cfg.attention_config = SimpleNamespace(prefix_anchored_decode_window=64)
+    with pytest.raises(ValueError, match="every participating rank"):
         apply_prefix_anchored_swa_constraints(cfg)
 
 
@@ -113,7 +131,7 @@ def _patch_visible_devices(monkeypatch, capabilities: list[tuple[int, int]]):
     assert current_platform.is_device_capability((7, 0)) is (capabilities[0] == (7, 0))
 
 
-def _build_vllm_config() -> VllmConfig:
+def _build_vllm_config(pp_size: int = 1) -> VllmConfig:
     model_config = ModelConfig(model="facebook/opt-125m", dtype="float16", seed=42)
     return VllmConfig(
         model_config=model_config,
@@ -126,27 +144,59 @@ def _build_vllm_config() -> VllmConfig:
             max_model_len=512,
             is_encoder_decoder=model_config.is_encoder_decoder,
         ),
-        parallel_config=ParallelConfig(),
+        parallel_config=ParallelConfig(
+            pipeline_parallel_size=pp_size,
+            distributed_executor_backend="mp" if pp_size > 1 else "uni",
+        ),
     )
 
 
 @pytest.mark.parametrize(
-    ("capabilities", "expected"),
+    ("capabilities", "pp_size", "expected"),
     [
-        pytest.param([SM75, SM70], True, id="sm70-stage-behind-sm75"),
-        pytest.param([SM75, SM75], False, id="homogeneous-sm75"),
+        pytest.param([SM75, SM70], 2, True, id="sm70-stage-behind-sm75"),
+        pytest.param([SM75, SM75], 2, False, id="homogeneous-sm75"),
+        pytest.param([SM75, SM70], 1, False, id="unused-sm70-must-not-change-defaults"),
     ],
 )
 def test_sm70_baseline_defaults_follow_any_visible_device(
-    monkeypatch, isolated_baseline_env, capabilities, expected
+    monkeypatch, isolated_baseline_env, capabilities, pp_size, expected
 ):
     """PP stage 0 on an sm75 card, stage 1 on sm70: the Flash-V100 baseline
     defaults must still be applied; a homogeneous sm75 box must stay clean."""
     _patch_visible_devices(monkeypatch, capabilities)
 
-    _build_vllm_config()
+    _build_vllm_config(pp_size)
 
     applied = {name for name in BASELINE_ENV if os.environ.get(name) == "1"}
     assert (applied == set(BASELINE_ENV)) is expected
     if not expected:
         assert not applied
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({}, (0,)),
+        ({"data_parallel_rank_local": 2}, (2,)),
+        ({"data_parallel_rank_local": None, "data_parallel_index": 1}, (1,)),
+        ({"world_size": 4, "local_world_size": 2, "nnodes_within_dp": 2}, (0, 1)),
+        ({"distributed_executor_backend": "external_launcher"}, (3,)),
+        ({"distributed_executor_backend": "ray"}, (0,)),
+    ],
+)
+def test_participation_matches_executor_assignment(monkeypatch, overrides, expected):
+    from vllm.config.vllm import _participating_cuda_device_ids
+
+    monkeypatch.setenv("LOCAL_RANK", "3")
+    monkeypatch.setattr(platforms, "current_platform", _fake_platform([SM75] * 4))
+    assert _participating_cuda_device_ids(_placement_config(**overrides)) == expected
+
+
+def test_explicit_uniproc_device_is_preserved(monkeypatch):
+    from vllm.config.vllm import _participating_cuda_device_ids
+
+    monkeypatch.setattr(platforms, "current_platform", _fake_platform([SM75, SM70]))
+    cfg = _placement_config()
+    cfg.device_config.device = torch.device("cuda:1")
+    assert _participating_cuda_device_ids(cfg) == (1,)

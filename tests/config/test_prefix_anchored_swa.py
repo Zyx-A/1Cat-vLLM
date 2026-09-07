@@ -27,11 +27,21 @@ def _config(window: int = 128) -> SimpleNamespace:
         ),
         model_config=SimpleNamespace(dtype=torch.float16, use_mla=False),
         parallel_config=SimpleNamespace(
+            distributed_executor_backend="uni",
+            data_parallel_backend="mp",
+            world_size=1,
+            local_world_size=1,
+            nnodes_within_dp=1,
+            data_parallel_rank_local=0,
+            data_parallel_index=0,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
             decode_context_parallel_size=1,
             prefill_context_parallel_size=1,
         ),
         kv_transfer_config=None,
         speculative_config=None,
+        device_config=SimpleNamespace(device=torch.device("cuda")),
     )
 
 
