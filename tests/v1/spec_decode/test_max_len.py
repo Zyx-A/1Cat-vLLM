@@ -116,7 +116,10 @@ def _native_mtp_yarn_config(
             "factor": 4.0,
             "original_max_position_embeddings": 262_144,
         }
-    target_hf_config = PretrainedConfig(rope_parameters=rope_parameters)
+    target_hf_config = PretrainedConfig(max_position_embeddings=262_144)
+    # Keep deliberately invalid fixtures out of Transformers' constructor
+    # validation so these cases exercise vLLM's own inheritance checks.
+    target_hf_config.rope_parameters = copy.deepcopy(rope_parameters)
     draft_hf_config = PretrainedConfig(max_position_embeddings=262_144)
     target_model_config = SimpleNamespace(
         model="test/native-mtp",
@@ -199,4 +202,36 @@ def test_native_mtp_does_not_modify_unextended_drafter() -> None:
 
     SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
 
+    assert draft_hf_config.to_dict() == original
+
+
+@pytest.mark.parametrize("factor", [0.0, 1.0, float("nan"), float("inf"), 1e308])
+def test_native_mtp_rejects_invalid_or_overflowing_yarn_factor(factor: float) -> None:
+    config, _ = _native_mtp_yarn_config()
+    config.target_model_config.hf_config.rope_parameters["factor"] = factor
+    with pytest.raises(ValueError):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+def test_native_mtp_respects_target_limit_below_yarn_limit() -> None:
+    config, _ = _native_mtp_yarn_config(max_model_len=800_001)
+    config.target_model_config.max_model_len = 800_000
+    with pytest.raises(ValueError, match="validated target YaRN limit=800000"):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+@pytest.mark.parametrize("key", ["factor", "original_max_position_embeddings"])
+def test_native_mtp_rejects_missing_yarn_parameters(key: str) -> None:
+    config, _ = _native_mtp_yarn_config()
+    config.target_model_config.hf_config.rope_parameters.pop(key)
+    with pytest.raises(ValueError, match="requires numeric"):
+        SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+
+
+@pytest.mark.parametrize("field,value", [("method", "eagle"), ("model", "other/draft")])
+def test_native_mtp_leaves_unrelated_drafters_unchanged(field: str, value: str) -> None:
+    config, draft_hf_config = _native_mtp_yarn_config()
+    setattr(config, field, value)
+    original = copy.deepcopy(draft_hf_config.to_dict())
+    SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
     assert draft_hf_config.to_dict() == original

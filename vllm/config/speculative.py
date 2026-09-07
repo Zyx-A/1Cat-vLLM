@@ -1124,10 +1124,12 @@ class SpeculativeConfig:
         original_limit = rope_parameters.get("original_max_position_embeddings")
         factor = rope_parameters.get("factor")
         try:
+            if original_limit is None or factor is None:
+                raise TypeError("YaRN original limit and factor must be present")
             original_limit_value = float(original_limit)
             factor_value = float(factor)
             draft_native_limit_value = float(draft_native_limit)
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(
                 "Native MTP YaRN extension requires numeric "
                 "original_max_position_embeddings and factor."
@@ -1148,7 +1150,12 @@ class SpeculativeConfig:
                 f"native={draft_native_limit!r}, factor={factor!r}."
             )
 
-        validated_yarn_limit = int(original_limit_value * factor_value)
+        scaled_limit = original_limit_value * factor_value
+        if not math.isfinite(scaled_limit):
+            raise ValueError(
+                "Native MTP YaRN extension requires a finite scaled limit."
+            )
+        validated_yarn_limit = int(scaled_limit)
         validated_limit = min(
             validated_yarn_limit,
             self.target_model_config.max_model_len,
