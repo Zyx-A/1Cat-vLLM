@@ -164,6 +164,83 @@ def test_pinned_host_ple_fp8_rows_are_gatherable_across_the_split_on_sm70(
     expected = checkpoint.float() * 0.25
     torch.testing.assert_close(output.float().cpu(), expected[ids.cpu()])
 
+    pointers = (layer._device_table_ptr, dict(layer._accelerator_weight_ptrs))
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            layer(ids)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        graph_output = layer(ids)
+    for offset in range(4):
+        # Reload both halves in-place; captured pointers must stay live.
+        reloaded = raw.roll(offset, dims=0).view(torch.float8_e4m3fn)
+        layer.load_shard(reloaded, checkpoint_start=0, tp_start=0, tp_end=8)
+        layer.prepare_accelerator_weight()
+        ids.copy_((ids + 1) % 8)
+        graph.replay()
+        expected = reloaded.float() * 0.25
+        torch.testing.assert_close(graph_output.float().cpu(), expected[ids.cpu()])
+        assert pointers == (layer._device_table_ptr, layer._accelerator_weight_ptrs)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires pinned memory")
+@pytest.mark.parametrize("host_rows", [0, 4, 8])
+def test_dummy_ple_tables_do_not_retain_uninitialized_bytes(monkeypatch, host_rows):
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "_ple_host_budget_bytes", lambda: host_rows * 8)
+    layer = _pinned_layer(num_embeddings=8)
+    empty = torch.empty
+
+    def poisoned_empty(*args, **kwargs):
+        result = empty(*args, **kwargs)
+        if result.dtype == torch.float8_e4m3fn:
+            result.view(torch.uint8).fill_(0x7F)  # E4M3 NaN, not valid dummy data.
+        return result
+
+    monkeypatch.setattr(ple_module.torch, "empty", poisoned_empty)
+    layer.prepare_accelerator_weight()
+    for table in (layer.ple_device_table, layer.ple_host_storage):
+        assert torch.all(table.view(torch.uint8) == 0)
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("kind", ["HOST", "HOST_RESERVE", "VRAM_RESERVE"])
+def test_ple_budget_rejects_invalid_values(monkeypatch, kind, value):
+    monkeypatch.setattr(ple_module.envs, f"VLLM_QWEN4EXP_PLE_{kind}_GIB", value)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        if kind == "HOST":
+            ple_module._ple_host_budget_bytes()
+        elif kind == "HOST_RESERVE":
+            ple_module._ple_host_reserve_bytes(32 * 1024**3)
+        else:
+            ple_module._ple_vram_reserve_bytes(32 * 1024**3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ple_host_allocation_failure_keeps_materialization_retryable(monkeypatch):
+    _patch_tp(monkeypatch, rank=0, world_size=1)
+    monkeypatch.setattr(ple_module, "_ple_host_budget_bytes", lambda: 4 * 8)
+    layer = _pinned_layer(num_embeddings=8)
+    empty = torch.empty
+
+    def failing_empty(*args, **kwargs):
+        if kwargs.get("pin_memory"):
+            raise RuntimeError("injected pinned allocation failure")
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(ple_module.torch, "empty", failing_empty)
+    with pytest.raises(RuntimeError, match="injected pinned allocation failure"):
+        layer.materialize_tables()
+    assert layer.ple_device_table is None
+    assert layer.ple_host_storage is None
+    assert layer._device_table_ptr == 0
+    monkeypatch.setattr(ple_module.torch, "empty", empty)
+    layer.materialize_tables()
+    assert (layer._device_rows, layer._host_rows) == (4, 4)
+
 
 @pytest.mark.parametrize(
     ("capability", "expected"),
@@ -228,15 +305,29 @@ def test_copy_ple_embedding_shard_split_matches_the_single_copy() -> None:
             vram, host, shard, checkpoint_start=start, tp_start=5, tp_end=15
         )
     torch.testing.assert_close(torch.cat([vram, host]), reference)
-    with pytest.raises(ValueError, match="exceeds the TP range"):
+    with pytest.raises(ValueError, match="do not cover"):
         copy_ple_embedding_shard_split_(
-            torch.zeros(11, 4, dtype=torch.int8),
+            torch.zeros(5, 4, dtype=torch.int8),
             host,
             checkpoint[:6],
             checkpoint_start=0,
             tp_start=5,
             tp_end=15,
         )
+
+
+@pytest.mark.parametrize("host_rows", [0, 4, 8, 12])
+def test_split_copy_accepts_tp_padding(host_rows: int) -> None:
+    checkpoint = torch.arange(20 * 4, dtype=torch.int8).view(20, 4)
+    device = torch.full((12 - host_rows, 4), -1, dtype=torch.int8)
+    host = torch.full((host_rows, 4), -1, dtype=torch.int8)
+    count = copy_ple_embedding_shard_split_(
+        device, host, checkpoint, checkpoint_start=0, tp_start=7, tp_end=17
+    )
+    result = torch.cat([device, host])
+    assert count == 10
+    torch.testing.assert_close(result[:10], checkpoint[7:17])
+    assert torch.all(result[10:] == -1)
 
 
 def test_auto_ple_host_budget_spills_only_the_shortfall() -> None:

@@ -156,12 +156,13 @@ def copy_ple_embedding_shard_split_(
     copy above handles each of them unchanged.
     """
 
-    boundary = tp_start + vram_table.shape[0]
-    if boundary > tp_end:
-        raise ValueError(
-            f"device part ({vram_table.shape[0]} rows) exceeds the TP range "
-            f"({tp_end - tp_start} rows)"
-        )
+    if tp_start < 0 or tp_end < tp_start:
+        raise ValueError("invalid TP vocabulary range")
+    if vram_table.shape[0] + host_table.shape[0] < tp_end - tp_start:
+        raise ValueError("split tables do not cover the requested TP range")
+    # Storage includes vocabulary padding, while checkpoint TP bounds do not.
+    # Padding can lie in either half and must not reject a valid checkpoint.
+    boundary = min(tp_end, tp_start + vram_table.shape[0])
     copied = 0
     if vram_table.shape[0]:
         copied += copy_ple_embedding_shard_(
@@ -171,7 +172,7 @@ def copy_ple_embedding_shard_split_(
             tp_start=tp_start,
             tp_end=boundary,
         )
-    if host_table.shape[0]:
+    if boundary < tp_end:
         copied += copy_ple_embedding_shard_(
             host_table,
             loaded_weight,
@@ -187,8 +188,8 @@ def kv_cache_bytes_for_max_model_len(vllm_config: "VllmConfig") -> int:
 
     Sums what every KV-owning layer of this pipeline stage declares. The specs
     are the engine's own source of truth for that number -- the same ones the
-    allocator consults later -- so the estimate cannot drift from what is
-    actually reserved.
+    allocator consults later. This is a per-layer estimate: hybrid cache
+    grouping and allocator padding can require additional capacity.
     """
 
     from vllm.config import get_layers_from_vllm_config

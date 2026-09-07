@@ -528,9 +528,10 @@ def _ple_host_budget_bytes() -> int | None:
     budget_gib = envs.VLLM_QWEN4EXP_PLE_HOST_GIB
     if budget_gib is None:
         return None
-    if budget_gib < 0:
+    if not math.isfinite(budget_gib) or budget_gib < 0:
         raise ValueError(
-            f"VLLM_QWEN4EXP_PLE_HOST_GIB must not be negative, got {budget_gib}"
+            f"VLLM_QWEN4EXP_PLE_HOST_GIB must be finite and non-negative, "
+            f"got {budget_gib}"
         )
     return int(budget_gib * 1024**3)
 
@@ -545,9 +546,9 @@ def _ple_host_reserve_bytes(host_total_bytes: int) -> int:
 
     reserve_gib = envs.VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB
     if reserve_gib is not None:
-        if reserve_gib < 0:
+        if not math.isfinite(reserve_gib) or reserve_gib < 0:
             raise ValueError(
-                "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB must not be negative, "
+                "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB must be finite and non-negative, "
                 f"got {reserve_gib}"
             )
         return int(reserve_gib * 1024**3)
@@ -567,6 +568,11 @@ def _ple_vram_reserve_bytes(device_total_bytes: int) -> int:
 
     reserve_gib = envs.VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB
     if reserve_gib is not None:
+        if not math.isfinite(reserve_gib) or reserve_gib < 0:
+            raise ValueError(
+                "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB must be finite and non-negative, "
+                f"got {reserve_gib}"
+            )
         return int(reserve_gib * 1024**3)
     return min(int(device_total_bytes * 0.08), 4 * 1024**3)
 
@@ -649,6 +655,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._device_table_ptr = 0
         self.ple_device_table: torch.Tensor | None = None
         self.ple_host_storage: torch.Tensor | None = None
+        self._checkpoint_shard_loaded = False
 
     def _resolve_host_budget(self, device: torch.device) -> int:
         """Host bytes for the table: as configured, or derived from headroom."""
@@ -731,17 +738,21 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 "and every tensor-parallel rank pins its own share. Lower the "
                 "requested context or VLLM_QWEN4EXP_PLE_HOST_GIB."
             )
-        self.ple_device_table = torch.empty(
+        device_table = torch.empty(
             (placement.vram_rows, self.embedding_dim),
             dtype=self._meta_weight_dtype,
             device=device,
         )
-        self.ple_host_storage = torch.empty(
+        host_storage = torch.empty(
             (placement.host_rows, self.embedding_dim),
             dtype=self._meta_weight_dtype,
             device="cpu",
             pin_memory=placement.host_rows > 0,
         )
+        # Publish only a complete allocation so a host allocation failure
+        # cannot leave the idempotent path pointing at a half-built table.
+        self.ple_device_table = device_table
+        self.ple_host_storage = host_storage
         self._device_rows = placement.vram_rows
         self._host_rows = placement.host_rows
         # Cached as a plain int: torch.compile cannot trace data_ptr() inside
@@ -769,7 +780,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.materialize_tables()
         assert self.ple_device_table is not None
         assert self.ple_host_storage is not None
-        return copy_ple_embedding_shard_split_(
+        copied = copy_ple_embedding_shard_split_(
             self.ple_device_table,
             self.ple_host_storage,
             loaded_weight,
@@ -777,6 +788,8 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             tp_start=tp_start,
             tp_end=tp_end,
         )
+        self._checkpoint_shard_loaded = True
+        return copied
 
     def get_accelerator_weight(self, device: torch.device) -> torch.Tensor:
         if device.type != "cuda":
@@ -806,6 +819,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return view
 
     def prepare_accelerator_weight(self) -> None:
+        self.materialize_tables()
+        if not self._checkpoint_shard_loaded and not self._accelerator_weight_views:
+            # Dummy loading initializes only the zero-row parameter, not these
+            # private tables. Ensure finite profiling data before graph capture.
+            # Real checkpoints load in-place before this post-load callback.
+            assert self.ple_device_table is not None
+            assert self.ple_host_storage is not None
+            self.ple_device_table.view(torch.uint8).zero_()
+            self.ple_host_storage.view(torch.uint8).zero_()
         self.get_accelerator_weight(
             torch.device("cuda", torch.accelerator.current_device_index())
         )
