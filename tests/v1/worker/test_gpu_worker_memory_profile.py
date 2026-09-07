@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.utils.mem_utils import MemorySnapshot
@@ -28,6 +29,7 @@ class _FakeRunner:
         self.model_memory_usage = weights_bytes
         self._device = device
         self.calls = 0
+        self.graph_calls = 0
         self._kept: list[torch.Tensor] = []
 
     def profile_run(self) -> None:
@@ -44,10 +46,24 @@ class _FakeRunner:
         torch.accelerator.synchronize(self._device)
 
     def profile_cudagraph_memory(self) -> int:
-        return 0
+        self.graph_calls += 1
+        return 32 * MiB
 
 
-def test_kv_budget_ignores_cold_compile_scratch() -> None:
+@pytest.mark.parametrize(
+    "graph_mode,estimate_graphs,graph_bytes",
+    [
+        (CUDAGraphMode.NONE, True, 0),
+        (CUDAGraphMode.FULL, False, 0),
+        (CUDAGraphMode.FULL, True, 32 * MiB),
+    ],
+)
+def test_kv_budget_ignores_cold_compile_scratch(
+    monkeypatch, graph_mode, estimate_graphs, graph_bytes
+) -> None:
+    monkeypatch.setattr(
+        envs, "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", estimate_graphs
+    )
     device = torch.device("cuda:0")
     torch.accelerator.empty_cache()
     worker = Worker.__new__(Worker)
@@ -60,7 +76,7 @@ def test_kv_budget_ignores_cold_compile_scratch() -> None:
         kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
     )
     worker.vllm_config = SimpleNamespace(
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE)
+        compilation_config=SimpleNamespace(cudagraph_mode=graph_mode)
     )
     runner = _FakeRunner(device, weights_bytes)
     worker.model_runner = runner
@@ -77,7 +93,20 @@ def test_kv_budget_ignores_cold_compile_scratch() -> None:
         - worker.non_torch_memory
         - worker.peak_activation_memory
         - weights_bytes
+        - graph_bytes
     )
     assert abs(charged - 64 * MiB) <= 32 * MiB
     assert runner.calls == 2
+    assert runner.graph_calls == int(graph_bytes > 0)
+    assert worker.cudagraph_memory_estimate == graph_bytes
     del weights
+
+
+def test_explicit_kv_bytes_profiles_once_and_skips_memory_estimation() -> None:
+    calls = []
+    worker = Worker.__new__(Worker)
+    worker.cache_config = SimpleNamespace(kv_cache_memory_bytes=128 * MiB)
+    worker.init_snapshot = SimpleNamespace(free_memory=1024 * MiB)
+    worker.model_runner = SimpleNamespace(profile_run=lambda: calls.append("profile"))
+    assert worker.determine_available_memory() == 128 * MiB
+    assert calls == ["profile"]
