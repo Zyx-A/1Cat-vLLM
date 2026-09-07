@@ -228,6 +228,38 @@ def test_native_mtp_rejects_missing_yarn_parameters(key: str) -> None:
         SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
 
 
+@pytest.mark.parametrize("rope_type", ["linear", "yarn"])
+def test_native_mtp_preserves_existing_matching_scaled_context(rope_type: str) -> None:
+    from vllm.config.model import _get_and_verify_max_len
+
+    config, draft_hf_config = _native_mtp_yarn_config()
+    rope = {
+        "rope_type": rope_type,
+        "factor": 4.0,
+        "original_max_position_embeddings": 262_144,
+    }
+    config.target_model_config.hf_config.rope_parameters = copy.deepcopy(rope)
+    draft_hf_config.rope_parameters = copy.deepcopy(rope)
+    original_rope = draft_hf_config.rope_parameters
+
+    def derive_limit(requested: int) -> int:
+        return _get_and_verify_max_len(
+            hf_config=draft_hf_config,
+            model_arch_config=SimpleNamespace(
+                derived_max_model_len_and_key=(262_144, "max_position_embeddings")
+            ),
+            tokenizer_config=None,
+            max_model_len=requested,
+            disable_sliding_window=False,
+            sliding_window=None,
+        )
+
+    config.draft_model_config.get_and_verify_max_len = derive_limit
+    assert derive_limit(-1) == 1_048_576
+    SpeculativeConfig._inherit_target_rope_for_extended_native_mtp(config)
+    assert draft_hf_config.rope_parameters is original_rope
+
+
 @pytest.mark.parametrize("field,value", [("method", "eagle"), ("model", "other/draft")])
 def test_native_mtp_leaves_unrelated_drafters_unchanged(field: str, value: str) -> None:
     config, draft_hf_config = _native_mtp_yarn_config()

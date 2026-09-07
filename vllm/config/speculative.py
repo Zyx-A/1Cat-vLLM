@@ -1111,6 +1111,14 @@ class SpeculativeConfig:
 
         target_text_config = get_hf_text_config(self.target_model_config.hf_config)
         rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        # A checkpoint may already carry valid scaling (including non-YaRN
+        # scaling). Preserve it when both models agree and its derived limit
+        # covers the request. Only missing extensions need target inheritance.
+        if (
+            getattr(draft_text_config, "rope_parameters", None) == rope_parameters
+            and self.max_model_len <= self.draft_model_config.get_and_verify_max_len(-1)
+        ):
+            return
         if (
             not isinstance(rope_parameters, dict)
             or rope_parameters.get("rope_type") != "yarn"
