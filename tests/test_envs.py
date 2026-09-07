@@ -36,6 +36,41 @@ def test_nixl_side_channel_host_is_not_compile_factor(
     assert "VLLM_NIXL_SIDE_CHANNEL_HOST" not in envs.compile_factors()
 
 
+def test_unregistered_vllm_env_vars_are_compile_factors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An out-of-tree kernel switch must change the compile cache key.
+
+    Forks and plugins read their own VLLM_-prefixed variables straight from
+    os.environ, so this module never declares them. They still select
+    kernels, so a compiled artifact from one route must not be reused for
+    another.
+    """
+    monkeypatch.delenv("VLLM_OUT_OF_TREE_KERNEL_ROUTE", raising=False)
+    baseline = envs.compile_factors()
+    assert "VLLM_OUT_OF_TREE_KERNEL_ROUTE" not in baseline
+
+    monkeypatch.setenv("VLLM_OUT_OF_TREE_KERNEL_ROUTE", "qpn")
+    with_switch = envs.compile_factors()
+    assert with_switch["VLLM_OUT_OF_TREE_KERNEL_ROUTE"] == "qpn"
+    assert with_switch != baseline
+
+    monkeypatch.setenv("VLLM_OUT_OF_TREE_KERNEL_ROUTE", "marlin")
+    assert envs.compile_factors() != with_switch
+
+
+def test_ignored_factors_stay_out_even_when_unregistered(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The ignore list wins over the out-of-tree sweep."""
+    monkeypatch.setenv("VLLM_PORT", "1234")
+    monkeypatch.setenv("VLLM_CACHE_ROOT", "/tmp/some-cache")
+
+    factors = envs.compile_factors()
+    assert "VLLM_PORT" not in factors
+    assert "VLLM_CACHE_ROOT" not in factors
+
+
 def test_getattr_with_cache(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_HOST_IP", "1.1.1.1")
     monkeypatch.setenv("VLLM_PORT", "1234")
