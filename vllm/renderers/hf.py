@@ -452,7 +452,168 @@ def _detect_content_format(
 
 @lru_cache(maxsize=32)
 def _detect_developer_role_support(chat_template: str) -> bool:
-    return '"developer"' in chat_template or "'developer'" in chat_template
+    """Detect an unconditional, reachable developer-role rendering branch."""
+    jinja_ast = _try_extract_ast(chat_template)
+    if jinja_ast is None:
+        return False
+
+    for loop_ast, message_varname in _iter_nodes_assign_messages_item(jinja_ast):
+        if _has_conditional_ancestor(jinja_ast, loop_ast):
+            continue
+        if loop_ast.test is not None:
+            loop_test, _ = _evaluate_condition_for_developer(
+                loop_ast.test, message_varname
+            )
+            if loop_test is not True:
+                continue
+
+        for node in loop_ast.body:
+            if not isinstance(node, jinja2.nodes.If):
+                continue
+
+            body = _select_developer_role_body(node, message_varname)
+            if body is None:
+                continue
+            if _body_calls_raise_exception(body):
+                return False
+            if _body_renders_output(body):
+                return True
+
+    return False
+
+
+def _has_conditional_ancestor(
+    root: jinja2.nodes.Node,
+    target: jinja2.nodes.Node,
+) -> bool:
+    pending = [(root, False)]
+    while pending:
+        node, is_conditional = pending.pop()
+        for child in node.iter_child_nodes():
+            child_is_conditional = is_conditional or isinstance(
+                node, jinja2.nodes.If | jinja2.nodes.CondExpr
+            )
+            if child is target:
+                return child_is_conditional
+            pending.append((child, child_is_conditional))
+    return False
+
+
+def _select_developer_role_body(
+    if_node: jinja2.nodes.If,
+    message_varname: str,
+) -> list[jinja2.nodes.Node] | None:
+    developer_condition_seen = False
+    for branch in [if_node, *if_node.elif_]:
+        value, mentions_developer = _evaluate_condition_for_developer(
+            branch.test, message_varname
+        )
+        developer_condition_seen |= mentions_developer
+        if value is None:
+            return None
+        if value:
+            return branch.body if developer_condition_seen else None
+
+    return if_node.else_ if developer_condition_seen else None
+
+
+def _evaluate_condition_for_developer(
+    node: jinja2.nodes.Node,
+    message_varname: str,
+) -> tuple[bool | None, bool]:
+    """Evaluate a condition with role=developer; None means not provable."""
+    if isinstance(node, jinja2.nodes.And | jinja2.nodes.Or):
+        left, left_mentions = _evaluate_condition_for_developer(
+            node.left, message_varname
+        )
+        right, right_mentions = _evaluate_condition_for_developer(
+            node.right, message_varname
+        )
+        mentions_developer = left_mentions or right_mentions
+        if isinstance(node, jinja2.nodes.And):
+            if left is False or right is False:
+                return False, mentions_developer
+            if left is True and right is True:
+                return True, mentions_developer
+        else:
+            if left is True or right is True:
+                return True, mentions_developer
+            if left is False and right is False:
+                return False, mentions_developer
+        return None, mentions_developer
+
+    if isinstance(node, jinja2.nodes.Not):
+        value, mentions_developer = _evaluate_condition_for_developer(
+            node.node, message_varname
+        )
+        return (None if value is None else not value), mentions_developer
+
+    if not isinstance(node, jinja2.nodes.Compare) or len(node.ops) != 1:
+        if isinstance(node, jinja2.nodes.Const) and isinstance(node.value, bool):
+            return node.value, False
+        return None, False
+
+    operand = node.ops[0]
+    left = node.expr
+    right = operand.expr
+    if _is_attr_access(left, message_varname, "role") and isinstance(
+        right, jinja2.nodes.Const
+    ):
+        mentions_developer = right.value == "developer"
+        if operand.op == "eq":
+            return right.value == "developer", mentions_developer
+        if operand.op == "ne":
+            return right.value != "developer", mentions_developer
+
+    if isinstance(left, jinja2.nodes.Const) and _is_attr_access(
+        right, message_varname, "role"
+    ):
+        mentions_developer = left.value == "developer"
+        if operand.op == "eq":
+            return left.value == "developer", mentions_developer
+        if operand.op == "ne":
+            return left.value != "developer", mentions_developer
+
+    if not _is_attr_access(left, message_varname, "role") or not isinstance(
+        right, jinja2.nodes.List | jinja2.nodes.Tuple
+    ):
+        return None, False
+
+    values = [
+        item.value for item in right.items if isinstance(item, jinja2.nodes.Const)
+    ]
+    if len(values) != len(right.items):
+        return None, "developer" in values
+
+    mentions_developer = "developer" in values
+    if operand.op == "in":
+        return mentions_developer, mentions_developer
+    if operand.op == "notin":
+        return not mentions_developer, mentions_developer
+    return None, mentions_developer
+
+
+def _body_calls_raise_exception(body: list[jinja2.nodes.Node]) -> bool:
+    for node in body:
+        calls = itertools.chain(
+            [node] if isinstance(node, jinja2.nodes.Call) else [],
+            node.find_all(jinja2.nodes.Call),
+        )
+        for call in calls:
+            if _is_var_access(call.node, "raise_exception"):
+                return True
+    return False
+
+
+def _body_renders_output(body: list[jinja2.nodes.Node]) -> bool:
+    for node in body:
+        if isinstance(node, jinja2.nodes.Output):
+            for child in node.nodes:
+                if not isinstance(child, jinja2.nodes.TemplateData):
+                    return True
+                if child.data.strip():
+                    return True
+    return False
 
 
 def _convert_developer_to_system(
@@ -479,7 +640,7 @@ def _consolidate_system_messages(
     very first message.  After developer-to-system conversion, system messages
     may appear at non-first positions; this merges them into a single message.
     """
-    system_contents: list[str] = []
+    system_contents: list[str | list[dict[str, Any]]] = []
     non_system: list[ConversationMessage] = []
     needs_consolidation = False
     for i, msg in enumerate(conversation):
@@ -487,14 +648,6 @@ def _consolidate_system_messages(
             if i > 0 or system_contents:
                 needs_consolidation = True
             content = msg.get("content", "")
-            if isinstance(content, list):
-                parts = []
-                for part in content:
-                    if isinstance(part, dict) and "text" in part:
-                        parts.append(part["text"])
-                    elif isinstance(part, str):
-                        parts.append(part)
-                content = "\n".join(parts)
             if content:
                 system_contents.append(content)
         else:
@@ -503,9 +656,30 @@ def _consolidate_system_messages(
     if not needs_consolidation:
         return conversation
 
+    if any(isinstance(content, list) for content in system_contents):
+        merged_parts: list[dict[str, Any]] = []
+        for content in system_contents:
+            if isinstance(content, str):
+                parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
+            else:
+                parts = [
+                    {"type": "text", "text": part}
+                    if isinstance(part, str)
+                    else copy.deepcopy(part)
+                    for part in content
+                ]
+            if not parts:
+                continue
+            if merged_parts:
+                merged_parts.append({"type": "text", "text": "\n\n"})
+            merged_parts.extend(parts)
+        merged_content: str | list[dict[str, Any]] = merged_parts
+    else:
+        merged_content = "\n\n".join(cast(list[str], system_contents))
+
     merged: ConversationMessage = {
         "role": "system",
-        "content": "\n\n".join(system_contents),
+        "content": merged_content,
     }
     return [merged, *non_system]
 
